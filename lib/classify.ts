@@ -20,9 +20,11 @@ function hasOtherAttendees(ev: CalendarEvent): boolean {
 }
 
 // 「（名前）出社 / テレワーク」等の勤務形態メモは予定ではない（空き扱い）。書式は固定運用
-function isWorkLocationNote(summary?: string): boolean {
-  if (!summary) return false;
-  return /出社|テレワーク/.test(summary);
+// 終日の予定に限定する（時間指定の「(会議) 社内 テレワーク運用定例」等を空きと誤判定しないため）
+function isWorkLocationNote(ev: CalendarEvent): boolean {
+  const isAllDay = !!ev.start?.date && !ev.start?.dateTime;
+  if (!isAllDay || !ev.summary) return false;
+  return /出社|テレワーク/.test(ev.summary);
 }
 
 // 機械シグナルで分かる分を先に判定。判定できなければ "ambiguous" を返す
@@ -32,7 +34,7 @@ export function classifyByMachineSignals(
   if (ev.status === "cancelled") return "free"; // キャンセル
   if (ev.transparency === "transparent") return "free"; // 「空き時間」マーク
   if (ev.eventType === "workingLocation") return "free"; // 勤務地（予定ではない）
-  if (isWorkLocationNote(ev.summary)) return "free"; // 出社/テレワークのメモは予定ではない
+  if (isWorkLocationNote(ev)) return "free"; // 終日の出社/テレワークのメモは予定ではない
   if (hasFixKeyword(ev.summary)) return "hard"; // タイトルに fix → 動かせない（最優先）
   if (ev.status === "tentative") return "tentative"; // 仮承諾（参加者がいても未確定なので仮扱い）
   if (hasOtherAttendees(ev)) return "hard"; // 自分以外の参加者がいる＝実会議→動かせない

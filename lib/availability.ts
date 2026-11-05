@@ -290,21 +290,15 @@ export function buildWeekSummary(
 
 // ===== メンバー別ヒートマップ（1日分・9:00–18:00 の30分帯）=====
 
-export type MemberSlotState = "free" | "soft" | "hard"; // 空 / オレンジ / 赤
+// 社内ルール: 共有される予定は動かせない予定のみ → 予定あり(busy)／空き(free) の2状態
+export type MemberSlotState = "free" | "busy";
 export type MemberHeatmap = {
   name: string;
   cells: MemberSlotState[]; // 9:00–18:00 の30分 ×18
+  error?: string; // 予定を取得できなかった場合（権限なし等）。cells は全て free になるので表示側で区別する
 };
 
-// 機械シグナル＋fix prefix のみで「動かせない(hard)／その他予定(soft)／空(free)」に寄せる（AIは使わない）
-function memberCellCategory(ev: CalendarEvent): MemberSlotState {
-  const c = classifyByMachineSignals(ev);
-  if (c === "free") return "free";
-  if (c === "hard") return "hard";
-  return "soft"; // soft / tentative / allday_block / ambiguous はすべて「その他予定」
-}
-
-// 指定日(ymd)の各メンバーについて、9:00–18:00 を30分刻みで色分けした帯を返す
+// 指定日(ymd)の各メンバーについて、9:00–18:00 を30分刻みで予定あり/空きにした帯を返す（AIは使わない）
 export function buildMemberDayHeatmaps(
   peopleTargets: TargetEvents[],
   ymd: string,
@@ -315,35 +309,14 @@ export function buildMemberDayHeatmaps(
       new Date(`${ymd}T${pad(Math.floor(m / 60))}:${pad(m % 60)}:00+09:00`).getTime(),
     );
   }
-  const dayStart = new Date(`${ymd}T00:00:00+09:00`).getTime();
-  const dayEnd = dayStart + 86400000;
 
   return peopleTargets.map((t) => {
-    const hard: { start: number; end: number }[] = [];
-    const soft: { start: number; end: number }[] = [];
-    for (const ev of t.events) {
-      const cat = memberCellCategory(ev);
-      if (cat === "free") continue;
-      let s: number, e: number;
-      if (ev.start?.dateTime && ev.end?.dateTime) {
-        s = new Date(ev.start.dateTime).getTime();
-        e = new Date(ev.end.dateTime).getTime();
-      } else if (ev.start?.date && ev.end?.date) {
-        s = new Date(`${ev.start.date}T00:00:00+09:00`).getTime();
-        e = new Date(`${ev.end.date}T00:00:00+09:00`).getTime(); // 終日 → その日全体
-      } else {
-        continue;
-      }
-      if (e <= dayStart || s >= dayEnd) continue; // 当日に重ならない
-      (cat === "hard" ? hard : soft).push({ start: s, end: e });
-    }
+    const busy = sharedBusyIntervals(t.events); // 候補の計算と同じ判定（終日予定はその日全体）
     const cells: MemberSlotState[] = slotStarts.map((st) => {
       const en = st + 30 * 60000;
-      if (hard.some((b) => st < b.end && b.start < en)) return "hard";
-      if (soft.some((b) => st < b.end && b.start < en)) return "soft";
-      return "free";
+      return busy.some((b) => st < b.end && b.start < en) ? "busy" : "free";
     });
-    return { name: t.name, cells };
+    return { name: t.name, cells, error: t.error };
   });
 }
 
@@ -453,6 +426,132 @@ export function findCandidateSlotsCategorized(
     }
   }
   return out;
+}
+
+// ===== IMPR-3: 全員空き／一部不可 の2段階候補（社内ルール: 共有予定は動かせない予定のみ）=====
+
+export type BusyInterval = { start: number; end: number };
+
+// 共有カレンダーの予定 → 埋まり区間。時刻あり予定＋終日予定（その日全体）を含む。
+// 空き扱い: キャンセル／「空き」マーク／勤務地／出社・テレワークのメモ（classifyByMachineSignals が "free"）
+export function sharedBusyIntervals(events: CalendarEvent[]): BusyInterval[] {
+  const out: BusyInterval[] = [];
+  for (const ev of events) {
+    if (classifyByMachineSignals(ev) === "free") continue;
+    if (ev.start?.dateTime && ev.end?.dateTime) {
+      out.push({
+        start: new Date(ev.start.dateTime).getTime(),
+        end: new Date(ev.end.dateTime).getTime(),
+      });
+    } else if (ev.start?.date && ev.end?.date) {
+      // 終日の共有予定（出張・休暇など）はその日全体を埋まり扱い（end.date は排他的）
+      out.push({
+        start: new Date(`${ev.start.date}T00:00:00+09:00`).getTime(),
+        end: new Date(`${ev.end.date}T00:00:00+09:00`).getTime(),
+      });
+    }
+  }
+  return out;
+}
+
+// 予約の開始時刻の選択肢（全員空きの枠）。会議室の空きは開始時刻ごとに違う
+export type StartOption = { start: string; end: string; roomAvailable: boolean };
+
+// 全員空きの時間帯。連続して全員が空いている開始時刻をまとめたもの
+// 例: 所要60分で 9:00・9:30・10:00 開始が全員空き → 時間帯 09:00〜11:00（starts は3件）
+export type FreeWindow = { start: string; end: string; starts: StartOption[] };
+
+// 一部の人が不可の枠（次善案。予約はしない）
+export type PartialSlot = {
+  start: string;
+  end: string;
+  roomAvailable: boolean;
+  unavailable: string[]; // その枠で予定が埋まっている人の名前
+};
+
+export type DayAvailability = {
+  ymd: string;
+  label: string; // 例: 11/6(金)
+  windows: FreeWindow[]; // 全員空きの時間帯（無い日は空）
+  partial: PartialSlot[]; // 一部不可（不可者が少ない順 → 近い順）。上位 partialPerDay 件
+};
+
+// 期間内の各平日（土日除く）について、9–18時を stepMinutes 刻みで走査して日ごとにまとめる
+// - 全員空き: 連続する開始時刻を時間帯(window)にまとめる
+// - 一部不可: 不可者が少ない順 → 近い順。全員が不可の枠（誰も出られない）は含めない
+// 全員空きの無い日も返す（呼び出し側で絞り込む）
+export function findAvailabilityByDay(
+  people: { name: string; busy: BusyInterval[] }[],
+  roomBusy: BusyInterval[],
+  durationMinutes: number,
+  range: { from: string; to: string },
+  options: { stepMinutes?: number; partialPerDay?: number } = {},
+): DayAvailability[] {
+  const step = options.stepMinutes ?? 30;
+  const partialPerDay = options.partialPerDay ?? 5;
+  const fromMs = new Date(`${range.from}T00:00:00+09:00`).getTime();
+  const toMs = new Date(`${range.to}T00:00:00+09:00`).getTime();
+  const days: DayAvailability[] = [];
+
+  for (let dayMs = fromMs; dayMs <= toMs; dayMs += 86400000) {
+    const d = new Date(dayMs);
+    const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo" }).format(d);
+    const weekday = new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Tokyo",
+      weekday: "short",
+    }).format(d);
+    if (weekday === "Sat" || weekday === "Sun") continue;
+
+    const windows: FreeWindow[] = [];
+    const partial: PartialSlot[] = [];
+    let current: FreeWindow | null = null;
+    let prevMin = -1;
+
+    const lastStartMinute = BUSINESS_END_HOUR * 60 - durationMinutes;
+    for (let m = BUSINESS_START_HOUR * 60; m <= lastStartMinute; m += step) {
+      const startIso = `${ymd}T${pad(Math.floor(m / 60))}:${pad(m % 60)}:00+09:00`;
+      const startMs = new Date(startIso).getTime();
+      const endMs = startMs + durationMinutes * 60000;
+      const endMin = m + durationMinutes;
+      const endIso = `${ymd}T${pad(Math.floor(endMin / 60))}:${pad(endMin % 60)}:00+09:00`;
+      const hits = (iv: BusyInterval[]) => iv.some((b) => startMs < b.end && b.start < endMs);
+      const roomAvailable = !hits(roomBusy);
+
+      const unavailable = people.filter((p) => hits(p.busy)).map((p) => p.name);
+
+      if (unavailable.length === 0) {
+        const opt: StartOption = { start: startIso, end: endIso, roomAvailable };
+        if (current && prevMin + step === m) {
+          current.starts.push(opt);
+          current.end = endIso;
+        } else {
+          current = { start: startIso, end: endIso, starts: [opt] };
+          windows.push(current);
+        }
+        prevMin = m;
+        continue;
+      }
+
+      current = null; // 全員空きが途切れる
+      if (people.length > 0 && unavailable.length === people.length) continue; // 誰も出られない
+      partial.push({ start: startIso, end: endIso, roomAvailable, unavailable });
+    }
+
+    // sort は安定なので、同数なら時刻順（走査順）のまま
+    partial.sort((a, b) => a.unavailable.length - b.unavailable.length);
+    days.push({
+      ymd,
+      label: d.toLocaleDateString("ja-JP", {
+        timeZone: "Asia/Tokyo",
+        month: "numeric",
+        day: "numeric",
+        weekday: "short",
+      }),
+      windows,
+      partial: partial.slice(0, partialPerDay),
+    });
+  }
+  return days;
 }
 
 // ===== M6-C: 会議室の付け忘れ検出 =====

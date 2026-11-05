@@ -25,7 +25,7 @@ export function SearchForm({ initialQ }: { initialQ: string }) {
       <Input
         value={q}
         onChange={(e) => setQ(e.target.value)}
-        placeholder="例: 来週 長尾さん内田さんと60分"
+        placeholder="例: 来週 長尾 内田と60分"
         disabled={isPending}
       />
       <Button type="submit" className="cursor-pointer" disabled={isPending}>

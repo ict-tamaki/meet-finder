@@ -6,30 +6,71 @@ import {
   businessDaysPage,
   businessDay,
   buildMemberDayHeatmaps,
-  findCandidateSlotsCategorized,
+  findAvailabilityByDay,
+  sharedBusyIntervals,
   roomBusyIntervals,
+  type DayAvailability,
   type MemberSlotState,
 } from "@/lib/availability";
-import { categorizeTargets } from "@/lib/categorize";
 import { parseMeetingRequest } from "@/lib/ai";
 import type { MeetingRequest } from "@/lib/schemas";
-import { SearchForm } from "./search-form";
-import { CandidateList, type CandidateRow } from "./candidate-list";
+import { ParticipantPicker } from "./participant-picker";
+import { CandidateList, type FallbackPartial } from "./candidate-list";
 import { Avatar } from "./avatar";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import Link from "next/link";
-import { CalendarCheck, UserRound } from "lucide-react";
+import {
+  CalendarCheck,
+  CalendarClock,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
+  DoorOpen,
+  ExternalLink,
+  LogOut,
+  TriangleAlert,
+  UserRound,
+  type LucideIcon,
+} from "lucide-react";
+
+// カード見出し。アイコンを色付きの丸に入れて、カードごとに色で見分けられるようにする
+function SectionTitle({
+  icon: Icon,
+  tone,
+  children,
+}: {
+  icon: LucideIcon;
+  tone: string; // アイコン丸の色クラス
+  children: React.ReactNode;
+}) {
+  return (
+    <p className="flex items-center gap-2 text-base font-semibold">
+      <span className={["flex h-7 w-7 items-center justify-center rounded-full", tone].join(" ")}>
+        <Icon className="h-4 w-4" />
+      </span>
+      {children}
+    </p>
+  );
+}
 
 // 週サマリーのページ送り上限（0..MAX_WO ＝ 今日から平日 (MAX_WO+1)*5 日先まで）
 const MAX_WO = 3;
 // メンバー予定の日送り上限（今日起点の平日オフセット）
 const MEMBER_MAX_MD = (MAX_WO + 1) * 5 - 1;
 
-// ナビ用URL（q / wo / md を保持。未指定の項目は付けない）
-function hrefWith(p: { q?: string; wo?: number; md?: number }): string {
+// ナビ用URL（q / p / dur / wo / md を保持。未指定の項目は付けない）
+function hrefWith(p: {
+  q?: string;
+  p?: string;
+  dur?: string;
+  wo?: number;
+  md?: number;
+}): string {
   const sp = new URLSearchParams();
   if (p.q) sp.set("q", p.q);
+  if (p.p) sp.set("p", p.p);
+  if (p.dur) sp.set("dur", p.dur);
   if (p.wo && p.wo > 0) sp.set("wo", String(p.wo));
   if (p.md != null && p.md > 0) sp.set("md", String(p.md));
   const s = sp.toString();
@@ -53,17 +94,57 @@ function fmtRange(start: string, end: string): string {
   return `${s}〜${e}`;
 }
 
-// メンバーヒートマップ1セルの色（赤=動かせない / オレンジ=その他予定 / 灰=空き）
-function memberCellColor(s: MemberSlotState): string {
-  if (s === "hard") return "bg-red-400";
-  if (s === "soft") return "bg-orange-300";
-  return "bg-zinc-200";
+// チップ検索の既定の探索期間: 翌営業日〜その14日後（JST）
+function defaultSearchRange(): { from: string; to: string } {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Tokyo" });
+  const todayYmd = fmt.format(new Date());
+  const first = businessDay(0); // 今日が平日なら今日、休日なら次の平日
+  const from = first.ymd === todayYmd ? businessDay(1).ymd : first.ymd;
+  const to = fmt.format(new Date(new Date(`${from}T00:00:00+09:00`).getTime() + 14 * 86400000));
+  return { from, to };
+}
+
+// ヒートマップは 9:00–18:00 を30分×18セル。コアタイム 11:00–16:00 は背景を水色にする
+const CELLS_PER_DAY = 18;
+const CORE_START = 4; // 11:00（9:00 + 30分×4）
+const CORE_END = 14; // 16:00（排他的）
+
+// 空きセルの色（コアタイム内は水色 / それ以外は灰）
+function freeCellColor(i: number): string {
+  return i >= CORE_START && i < CORE_END ? "bg-brand/20" : "bg-kachi/10";
+}
+
+// メンバーヒートマップ1セルの色（勝色=予定あり / 空き）
+function memberCellColor(s: MemberSlotState, i: number): string {
+  return s === "busy" ? "bg-kachi" : freeCellColor(i);
+}
+
+// 時刻の目盛り（9〜18時）。コアタイム 11–16 は背景の帯で示す
+function TimeAxis() {
+  const left = (CORE_START / CELLS_PER_DAY) * 100;
+  const width = ((CORE_END - CORE_START) / CELLS_PER_DAY) * 100;
+  return (
+    <div className="flex items-center gap-3">
+      <div className="w-36 shrink-0" />
+      <div className="relative flex-1">
+        <div
+          className="absolute inset-y-0 rounded bg-brand/20"
+          style={{ left: `${left}%`, width: `${width}%` }}
+        />
+        <div className="relative flex justify-between text-xs text-muted-foreground">
+          {[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((h) => (
+            <span key={h}>{h}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; wo?: string; md?: string }>;
+  searchParams: Promise<{ q?: string; wo?: string; md?: string; p?: string; dur?: string }>;
 }) {
   // auth.ts の async session(...) によって UI側で...
   // const session = await auth();
@@ -79,7 +160,7 @@ export default async function Home({
           みんなの日程調整くん
         </h1>
         <p className="text-sm text-muted-foreground">
-          AIで会議の空き枠を見つけてワンタップ予約
+          みんなの空き時間と会議室をまとめて確認して、ワンタップで予約
         </p>
         <form action={async () => { "use server"; await signIn("google"); }}>
           <Button type="submit" size="lg">Googleでログイン</Button>
@@ -103,7 +184,8 @@ export default async function Home({
   }
 
   // 入力された一文をパース（?q= で渡ってくる）。?wo=週送り / ?md=メンバー予定の日送り
-  const { q, wo: woRaw, md: mdRaw } = await searchParams;
+  // ?p=選択メール(カンマ区切り) / ?dur=所要時間(分) はチップ選択の状態
+  const { q, wo: woRaw, md: mdRaw, p: pRaw, dur: durRaw } = await searchParams;
   const wo = Math.min(MAX_WO, Math.max(0, Number.parseInt(woRaw ?? "0", 10) || 0));
   // md 未指定なら表示窓の先頭日（wo*5）＝5営業日ナビと連動。指定があればその日
   const md = Math.min(
@@ -119,18 +201,40 @@ export default async function Home({
     parsed = { request, matched, unmatched };
   }
 
-  // 解析できたら候補を計算（参加者＋会議室の予定を取得 → 分類 → 近い順 → AIで根拠付け）
-  let candidateRows: CandidateRow[] | null = null;
-  if (parsed && parsed.matched.length > 0) {
-    // 候補計算には「自分（ログイン本人）」も必ず含める
-    const selfEmail = session.user?.email;
-    const calcPeople = [...parsed.matched];
-    if (selfEmail && !calcPeople.some((p) => p.email === selfEmail)) {
-      calcPeople.push(
-        PEOPLE.find((p) => p.email === selfEmail) ?? { name: "自分", email: selfEmail },
-      );
-    }
+  // チップの選択状態。自然文を解析したときは解析結果（＋自分）を反映、無ければ URL の ?p= / ?dur=
+  const selfEmail = session.user?.email;
+  const knownEmails = new Set(PEOPLE.map((p) => p.email));
+  let selectedEmails: string[];
+  let selectedDuration: number;
+  if (parsed) {
+    selectedEmails = parsed.matched.map((p) => p.email);
+    if (selfEmail && !selectedEmails.includes(selfEmail)) selectedEmails.push(selfEmail);
+    selectedEmails = selectedEmails.filter((e) => knownEmails.has(e));
+    selectedDuration = parsed.request.durationMinutes;
+  } else {
+    selectedEmails = (pRaw ?? "").split(",").filter((e) => knownEmails.has(e));
+    const d = Number.parseInt(durRaw ?? "", 10);
+    selectedDuration = [30, 60, 90, 120].includes(d) ? d : 60;
+  }
 
+  // 候補を計算する条件: 自然文を解析して参加者が見つかった／チップ検索（?p=）で1人以上選んだ
+  const searched = parsed ? parsed.matched.length > 0 : pRaw != null && selectedEmails.length > 0;
+
+  // 検索対象＝チップの選択（自然文のときは解析結果＋自分）。自分が名簿に無い場合も自然文では含める
+  const calcPeople: Person[] = selectedEmails
+    .map((e) => PEOPLE.find((p) => p.email === e))
+    .filter((p): p is Person => p !== undefined);
+  if (parsed && selfEmail && !knownEmails.has(selfEmail)) {
+    calcPeople.push({ name: "自分", email: selfEmail });
+  }
+
+  // 候補を計算（選択した人＋会議室の予定を取得 → 埋まり区間 → 日ごとの全員空き時間帯／一部不可。AIは使わない）
+  let candidateDays: DayAvailability[] | null = null; // 全員空きのある日だけ
+  let fallbackPartial: FallbackPartial[] = []; // 全員空きの日が1日も無いときの次善案
+  let unreadable: string[] = []; // 予定を取得できなかった人（権限なし等）
+  let searchInfo = "";
+  if (searched) {
+    const range = parsed ? parsed.request.dateRange : defaultSearchRange();
     const targets = [
       ...calcPeople.map((p) => ({ name: p.name, calendarId: p.email })),
       { name: ROOM.name, calendarId: ROOM.calendarId },
@@ -139,39 +243,35 @@ export default async function Home({
     const events = await listEventsForTargets(
       session.accessToken,
       targets,
-      `${parsed.request.dateRange.from}T00:00:00+09:00`,
-      `${parsed.request.dateRange.to}T23:59:59+09:00`,
+      `${range.from}T00:00:00+09:00`,
+      `${range.to}T23:59:59+09:00`,
     );
     const peopleTargets = events.filter((e) => e.calendarId !== ROOM.calendarId);
     const roomTarget = events.find((e) => e.calendarId === ROOM.calendarId);
+    unreadable = peopleTargets.filter((t) => t.error).map((t) => t.name);
 
-    // 機械＋AIで分類してから候補算出（hardは除外、softは「要調整」で残す）
-    const categorized = await categorizeTargets(peopleTargets);
-    const roomBusy = roomBusyIntervals(roomTarget?.events ?? []);
-    const exSlots = findCandidateSlotsCategorized(
-      categorized,
-      roomBusy,
-      parsed.request.durationMinutes,
-      parsed.request.dateRange,
+    const allDays = findAvailabilityByDay(
+      peopleTargets.map((t) => ({ name: t.name, busy: sharedBusyIntervals(t.events) })),
+      roomBusyIntervals(roomTarget?.events ?? []),
+      selectedDuration,
+      range,
     );
-
-    // 空き(緑)も要調整(オレンジ)も近い順で1リストに統合（上位6件）
-    const topSlots = exSlots.slice(0, 6);
-    candidateRows = topSlots.map((s) => ({
-      start: s.start,
-      end: s.end,
-      label: fmtRange(s.start, s.end),
-      roomAvailable: s.roomAvailable,
-      adjustable: s.adjustable,
-      softConflicts: s.softConflicts,
-    }));
+    candidateDays = allDays.filter((d) => d.windows.length > 0);
+    if (candidateDays.length === 0) {
+      // 全員空きが1日も無い → 期間全体から、不可者が少ない順に次善案を6件
+      fallbackPartial = allDays
+        .flatMap((d) => d.partial)
+        .sort((a, b) => a.unavailable.length - b.unavailable.length || a.start.localeCompare(b.start))
+        .slice(0, 6)
+        .map((s) => ({ ...s, label: fmtRange(s.start, s.end) }));
+    }
+    // 参加者はチップで見えているので、所要時間と探した期間だけ出す
+    searchInfo = `${selectedDuration}分 ／ ${range.from.slice(5).replace("-", "/")}〜${range.to.slice(5).replace("-", "/")}`;
   }
 
   // 予約に渡す情報（参加者のメール。会議室は候補ごとに付け外しするのでここには含めない）
-  const peopleAttendees = parsed ? parsed.matched.map((p) => p.email) : [];
-  const bookingSummary = parsed
-    ? `会議：${parsed.matched.map((p) => p.name).join("、")}`
-    : "";
+  const peopleAttendees = searched ? calcPeople.map((p) => p.email) : [];
+  const bookingSummary = searched ? `会議：${calcPeople.map((p) => p.name).join("、")}` : "";
 
   // 表示する平日5日（今日起点・wo ページ目）＋ メンバー一覧の表示日（md 番目の平日）
   const days = businessDaysPage(wo);
@@ -205,10 +305,10 @@ export default async function Home({
   );
 
   return (
-    <main className="mx-auto max-w-6xl p-6">
-      <div className="mb-6 flex items-center justify-between">
+    <main className="mx-auto flex min-h-screen w-full max-w-[1760px] flex-col px-6 py-3">
+      <div className="mb-3 flex items-center justify-between">
         <h1 className="flex items-center gap-2 text-xl font-semibold">
-          <CalendarCheck className="h-5 w-5 text-primary" />
+          <CalendarCheck className="h-6 w-6 text-primary" />
           みんなの日程調整くん
         </h1>
         <div className="flex items-center gap-3">
@@ -216,21 +316,31 @@ export default async function Home({
             href="https://calendar.google.com/calendar/"
             target="_blank"
             rel="noreferrer"
-            className="text-sm text-muted-foreground underline-offset-4 hover:underline"
+            className="flex items-center gap-1 text-sm text-muted-foreground underline-offset-4 hover:underline"
           >
-            Googleカレンダー ↗
+            <ExternalLink className="h-3.5 w-3.5" />
+            Googleカレンダー
           </a>
           <form action={async () => { "use server"; await signOut(); }}>
-            <Button type="submit" className="cursor-pointer" variant="outline" size="sm">ログアウト</Button>
+            <Button type="submit" className="cursor-pointer" variant="outline" size="sm">
+              <LogOut className="h-3.5 w-3.5" />
+              ログアウト
+            </Button>
           </form>
         </div>
       </div>
 
-      {/* 一文で依頼を入力（解析中はローディング表示） */}
-      <SearchForm initialQ={q ?? ""} />
+      {/* 参加者チップ＋所要時間（選択状態が変わったら key で初期化し直す） */}
+      <ParticipantPicker
+        key={`${selectedEmails.join(",")}|${selectedDuration}`}
+        people={PEOPLE.map(({ name, email, image }) => ({ name, email, image }))}
+        initialSelected={selectedEmails}
+        initialDuration={selectedDuration}
+      />
 
+      {/* 自然文の入力欄(SearchForm)は画面から外した。?q= を直接指定した場合の解析結果だけ表示する */}
       {parsed && (
-        <Card className="mb-6">
+        <Card className="mb-4 py-3">
           <CardContent>
             「{q}」を解析しました。{" "}
             参加者:{" "}
@@ -249,92 +359,222 @@ export default async function Home({
         </Card>
       )}
 
-      {candidateRows && (
-        <div className="mb-6">
-          <h2 className="mb-2 font-medium">候補（近い順）</h2>
-          {candidateRows.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              条件に合う空き枠が見つかりませんでした。
+      {/* 空き候補。検索前も枠を確保して、検索でレイアウトが動かないようにする */}
+      <Card className="mb-4 gap-2 border-t-4 border-t-gold py-3">
+        <CardContent className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <SectionTitle icon={CalendarClock} tone="bg-kachi text-white">
+              空き候補
+            </SectionTitle>
+            {searchInfo && (
+              <span className="rounded-full bg-muted px-2.5 py-0.5 text-xs text-muted-foreground">
+                {searchInfo}
+              </span>
+            )}
+            {/* 検索前の案内は見出しと同じ行に出して、枠の高さを抑える */}
+            {candidateDays === null && (
+              <p className="text-xs text-muted-foreground">
+                参加者と所要時間を選んで「候補を探す」を押してください
+              </p>
+            )}
+          </div>
+          {unreadable.length > 0 && (
+            <p className="flex items-center gap-1 text-xs text-gold-deep">
+              <TriangleAlert className="h-3.5 w-3.5" />
+              予定を取得できなかった人: {unreadable.join("・")}（空きとして扱っています）
             </p>
-          ) : (
+          )}
+          {candidateDays !== null && (
             <CandidateList
-              rows={candidateRows}
+              key={`${peopleAttendees.join(",")}|${searchInfo}`}
+              days={candidateDays}
+              fallbackPartial={fallbackPartial}
               peopleAttendees={peopleAttendees}
               roomCalendarId={ROOM.calendarId}
               defaultSummary={bookingSummary}
+              totalPeople={calcPeople.length}
             />
           )}
-        </div>
-      )}
+        </CardContent>
+      </Card>
 
-      {/* メンバーの予定 と 会議室の空き状況を横並び（狭い画面では縦積み） */}
-      <div className="flex flex-col gap-6 lg:flex-row lg:items-start">
-        {/* メンバーの予定（先頭日の1日分・9:00–18:00 のヒートマップ帯） */}
-        <Card className="lg:flex-1 lg:min-w-0">
-          <CardContent className="flex flex-col gap-3">
+      {/* メンバーの予定 ／ 会議室の空き状況（それぞれ独立したカード。狭い画面では縦積み） */}
+      <div className="grid flex-1 gap-4 lg:grid-cols-2">
+        {/* メンバーの予定（1日分・9:00–18:00 のヒートマップ帯） */}
+        <Card className="gap-2 py-3">
+          <CardContent className="flex flex-1 flex-col gap-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm font-medium">
-                メンバーの予定（{memberDay.label} 9:00–18:00）
-              </p>
+              <div className="flex items-center gap-3">
+                <SectionTitle icon={CalendarDays} tone="bg-kachi text-white">
+                  メンバーの予定
+                </SectionTitle>
+                <span className="rounded-full bg-paper px-2.5 py-0.5 text-sm font-medium text-kachi">
+                  {memberDay.label}
+                </span>
+              </div>
               <div className="flex items-center gap-2">
                 {md > 0 ? (
-                  <Link href={hrefWith({ q, wo, md: md - 1 })}>
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, md: md - 1 })}>
                     <Button type="button" variant="outline" size="sm">
-                      ← 前日
+                      <ChevronLeft className="h-4 w-4" />
+                      前日
                     </Button>
                   </Link>
                 ) : (
                   <Button type="button" variant="outline" size="sm" disabled>
-                    ← 前日
+                    <ChevronLeft className="h-4 w-4" />
+                    前日
                   </Button>
                 )}
                 {md < MEMBER_MAX_MD ? (
-                  <Link href={hrefWith({ q, wo, md: md + 1 })}>
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, md: md + 1 })}>
                     <Button type="button" variant="outline" size="sm">
-                      翌日 →
+                      翌日
+                      <ChevronRight className="h-4 w-4" />
                     </Button>
                   </Link>
                 ) : (
                   <Button type="button" variant="outline" size="sm" disabled>
-                    翌日 →
+                    翌日
+                    <ChevronRight className="h-4 w-4" />
                   </Button>
                 )}
               </div>
             </div>
 
-            {/* 時刻の目盛り（9〜18時） */}
-            <div className="flex items-center gap-3">
-              <div className="w-28 shrink-0" />
-              <div className="flex flex-1 justify-between text-[10px] text-muted-foreground">
-                {[9, 10, 11, 12, 13, 14, 15, 16, 17, 18].map((h) => (
-                  <span key={h}>{h}</span>
-                ))}
+            <TimeAxis />
+
+            {/* メンバー行（左=アイコン＋名前 / 右=ヒートマップ帯） */}
+            {/* 行は画面の残り高さに合わせて伸縮する（最小 40px / 最大 48px。セルが縦長にならない範囲） */}
+            <div className="flex flex-1 flex-col">
+              {memberHeatmaps.map((m) => {
+                const person = PEOPLE.find((p) => p.name === m.name);
+                const isSelected = person !== undefined && selectedEmails.includes(person.email);
+                return (
+                <div
+                  key={m.name}
+                  className={[
+                    "flex max-h-12 min-h-10 flex-1 items-stretch gap-3 border-b px-1 py-1 last:border-b-0",
+                    isSelected ? "rounded bg-paper" : "",
+                  ].join(" ")}
+                >
+                  <div className="flex w-36 shrink-0 items-center gap-2">
+                    <Avatar src={person?.image} name={m.name} size={32} />
+                    <span className={["truncate text-base", isSelected ? "font-semibold" : ""].join(" ")}>
+                      {m.name}
+                    </span>
+                  </div>
+                  {m.error ? (
+                    <div className="flex flex-1 items-center rounded bg-muted px-2 text-xs text-muted-foreground">
+                      予定を取得できません
+                    </div>
+                  ) : (
+                    <div className="flex flex-1 gap-px overflow-hidden rounded">
+                      {m.cells.map((s, i) => (
+                        <div
+                          key={i}
+                          title={`${m.name} ${9 + Math.floor(i / 2)}:${i % 2 === 0 ? "00" : "30"} ${
+                            s === "busy" ? "予定あり" : "空き"
+                          }`}
+                          className={["flex-1", memberCellColor(s, i)].join(" ")}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+                );
+              })}
+            </div>
+
+            {/* 凡例 */}
+            <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-4 w-4 rounded-sm bg-kachi" /> 予定あり
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-4 w-4 rounded-sm bg-kachi/10" /> 空き
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-4 w-4 rounded-sm bg-brand/20" /> コアタイム(11–16時)の空き
+              </span>
+              {selectedEmails.length > 0 && (
+                <span className="flex items-center gap-1">
+                  <span className="inline-block h-4 w-4 rounded-sm bg-paper ring-1 ring-border" />{" "}
+                  選択中の参加者
+                </span>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* 会議室の空き状況（5営業日・1日1行の帯。メンバーの選択とは無関係に常に表示） */}
+        <Card className="gap-2 py-3">
+          <CardContent className="flex flex-1 flex-col gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-3">
+                <SectionTitle icon={DoorOpen} tone="bg-kachi text-white">
+                  会議室の空き状況
+                </SectionTitle>
+                <span className="rounded-full bg-paper px-2.5 py-0.5 text-sm font-medium text-kachi">
+                  {summary.days[0]?.label}〜{summary.days[summary.days.length - 1]?.label}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                {wo > 0 ? (
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo - 1 })}>
+                    <Button type="button" variant="outline" size="sm">
+                      <ChevronLeft className="h-4 w-4" />
+                      前の5営業日
+                    </Button>
+                  </Link>
+                ) : (
+                  <Button type="button" variant="outline" size="sm" disabled>
+                    <ChevronLeft className="h-4 w-4" />
+                    前の5営業日
+                  </Button>
+                )}
+                {wo < MAX_WO ? (
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo + 1 })}>
+                    <Button type="button" variant="outline" size="sm">
+                      次の5営業日
+                      <ChevronRight className="h-4 w-4" />
+                    </Button>
+                  </Link>
+                ) : (
+                  <Button type="button" variant="outline" size="sm" disabled>
+                    次の5営業日
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                )}
               </div>
             </div>
 
-            {/* メンバー行（左=アイコン＋名前 / 右=ヒートマップ帯） */}
-            <div className="flex flex-col">
-              {memberHeatmaps.map((m) => (
+            <TimeAxis />
+
+            {/* 行は画面の残り高さに合わせて伸縮する（最小 40px / 最大 64px） */}
+            <div className="flex flex-1 flex-col">
+              {summary.days.map((d) => (
                 <div
-                  key={m.name}
-                  className="flex items-center gap-3 border-b py-1.5 last:border-b-0"
+                  key={d.label}
+                  className="flex max-h-16 min-h-10 flex-1 items-stretch gap-3 border-b py-1 last:border-b-0"
                 >
-                  <div className="flex w-28 shrink-0 items-center gap-2">
-                    <Avatar
-                      src={PEOPLE.find((p) => p.name === m.name)?.image}
-                      name={m.name}
-                    />
-                    <span className="truncate text-sm">{m.name}</span>
-                  </div>
+                  <span className="w-36 shrink-0 self-center text-base font-medium">{d.label}</span>
                   <div className="flex flex-1 gap-px overflow-hidden rounded">
-                    {m.cells.map((s, i) => (
+                    {d.cells.map((c, i) => (
                       <div
                         key={i}
-                        title={`${m.name} ${9 + Math.floor(i / 2)}:${i % 2 === 0 ? "00" : "30"} ${
-                          s === "hard" ? "動かせない予定" : s === "soft" ? "予定あり" : "空き"
+                        title={`${d.label} ${summary.timeLabels[i] ?? ""} / 会議室 ${
+                          c.roomBusy ? (c.roomVisitor ? "予約済み（来客）" : "予約済み") : "空き"
                         }`}
-                        className={["h-5 flex-1", memberCellColor(s)].join(" ")}
-                      />
+                        className={[
+                          "flex flex-1 items-center justify-center",
+                          c.roomBusy ? "bg-kachi" : freeCellColor(i),
+                        ].join(" ")}
+                      >
+                        {c.roomVisitor && (
+                          <UserRound className="h-4 w-4 text-gold" aria-label="来客" />
+                        )}
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -344,113 +584,19 @@ export default async function Home({
             {/* 凡例 */}
             <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
               <span className="flex items-center gap-1">
-                <span className="inline-block h-4 w-4 bg-red-400" /> 動かせない（会議・fix）
+                <span className="inline-block h-4 w-4 rounded-sm bg-kachi/10" /> 空き
               </span>
               <span className="flex items-center gap-1">
-                <span className="inline-block h-4 w-4 bg-orange-300" /> その他予定
+                <span className="inline-block h-4 w-4 rounded-sm bg-kachi" /> 予約済み
               </span>
               <span className="flex items-center gap-1">
-                <span className="inline-block h-4 w-4 bg-zinc-200" /> 空き
-              </span>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="lg:flex-1 lg:min-w-0">
-          <CardContent className="flex flex-col gap-3">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <p className="text-sm font-medium">
-                会議室の空き状況（平日 9:00–18:00）
-              </p>
-              <div className="flex items-center gap-2">
-                {wo > 0 ? (
-                  <Link href={hrefWith({ q, wo: wo - 1 })}>
-                    <Button type="button" variant="outline" size="sm">
-                      ← 前の5営業日
-                    </Button>
-                  </Link>
-                ) : (
-                  <Button type="button" variant="outline" size="sm" disabled>
-                    ← 前の5営業日
-                  </Button>
-                )}
-                {wo < MAX_WO ? (
-                  <Link href={hrefWith({ q, wo: wo + 1 })}>
-                    <Button type="button" variant="outline" size="sm">
-                      次の5営業日 →
-                    </Button>
-                  </Link>
-                ) : (
-                  <Button type="button" variant="outline" size="sm" disabled>
-                    次の5営業日 →
-                  </Button>
-                )}
-              </div>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {summary.days[0]?.label} 〜 {summary.days[summary.days.length - 1]?.label}
-            </p>
-
-            <div className="overflow-x-auto">
-              <table className="w-full table-fixed border-collapse text-center text-xs">
-                <thead>
-                  <tr>
-                    <th className="w-24 p-1"></th>
-                    {summary.days.map((d) => (
-                      <th key={d.label} className="p-1 font-medium whitespace-nowrap">
-                        {d.label}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {summary.timeLabels.map((time, rowIdx) => (
-                    <tr key={time}>
-                      <td className="pr-2 text-right text-muted-foreground whitespace-nowrap">
-                        {time}
-                      </td>
-                      {summary.days.map((d) => {
-                        const c = d.cells[rowIdx];
-                        return (
-                          <td
-                            key={d.label + time}
-                            title={`${d.label} ${time} / 会議室 ${
-                              c?.roomBusy
-                                ? c?.roomVisitor
-                                  ? "予約済み（来客）"
-                                  : "予約済み"
-                                : "空き"
-                            }`}
-                            className={[
-                              "h-8 border border-white",
-                              c?.roomBusy ? "bg-red-400" : "bg-zinc-200",
-                            ].join(" ")}
-                          >
-                            {c?.roomVisitor && (
-                              <UserRound className="inline-block h-3.5 w-3.5 text-white" aria-label="来客" />
-                            )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-
-            {/* 凡例 */}
-            <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
-              <span className="flex items-center gap-1">
-                <span className="inline-block h-4 w-4 bg-zinc-200" /> 空き
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="inline-block h-4 w-4 bg-red-400" /> 予約済み
-              </span>
-              <span className="flex items-center gap-1">
-                <span className="flex h-4 w-4 items-center justify-center bg-red-400">
-                  <UserRound className="h-3 w-3 text-white" />
+                <span className="flex h-4 w-4 items-center justify-center rounded-sm bg-kachi">
+                  <UserRound className="h-3 w-3 text-gold" />
                 </span>{" "}
-                来客あり（来社）
+                来客あり
+              </span>
+              <span className="flex items-center gap-1">
+                <span className="inline-block h-4 w-4 rounded-sm bg-brand/20" /> コアタイム(11–16時)の空き
               </span>
             </div>
           </CardContent>
