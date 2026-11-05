@@ -1,6 +1,12 @@
 import { auth, signIn, signOut } from "@/auth";
 import { listEventsForTargets } from "@/lib/google";
-import { buildTargets, ROOM, PEOPLE, resolveParticipants, type Person } from "@/lib/people";
+import { ROOM, PEOPLE, resolveParticipants, type Person } from "@/lib/people";
+import {
+  dayLabelOf,
+  memberDayRange,
+  resolveMemberDay,
+  shiftBusinessDay,
+} from "@/lib/member-day";
 import {
   buildWeekSummary,
   businessDaysPage,
@@ -15,6 +21,7 @@ import {
 import { parseMeetingRequest } from "@/lib/ai";
 import type { MeetingRequest } from "@/lib/schemas";
 import { ParticipantPicker } from "./participant-picker";
+import { MemberDayPicker } from "./member-day-picker";
 import { CandidateList, type FallbackPartial } from "./candidate-list";
 import { Avatar } from "./avatar";
 import { Button } from "@/components/ui/button";
@@ -56,23 +63,22 @@ function SectionTitle({
 
 // 週サマリーのページ送り上限（0..MAX_WO ＝ 今日から平日 (MAX_WO+1)*5 日先まで）
 const MAX_WO = 3;
-// メンバー予定の日送り上限（今日起点の平日オフセット）
-const MEMBER_MAX_MD = (MAX_WO + 1) * 5 - 1;
 
-// ナビ用URL（q / p / dur / wo / md を保持。未指定の項目は付けない）
+// ナビ用URL（q / p / dur / wo / d を保持。未指定の項目は付けない）
+// d = メンバーの予定で表示する日（YYYY-MM-DD）。会議室の表示(wo)とは独立
 function hrefWith(p: {
   q?: string;
   p?: string;
   dur?: string;
   wo?: number;
-  md?: number;
+  d?: string;
 }): string {
   const sp = new URLSearchParams();
   if (p.q) sp.set("q", p.q);
   if (p.p) sp.set("p", p.p);
   if (p.dur) sp.set("dur", p.dur);
   if (p.wo && p.wo > 0) sp.set("wo", String(p.wo));
-  if (p.md != null && p.md > 0) sp.set("md", String(p.md));
+  if (p.d) sp.set("d", p.d);
   const s = sp.toString();
   return s ? `/?${s}` : "/";
 }
@@ -145,7 +151,7 @@ function TimeAxis({ labelWidth }: { labelWidth: string }) {
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; wo?: string; md?: string; p?: string; dur?: string }>;
+  searchParams: Promise<{ q?: string; wo?: string; d?: string; p?: string; dur?: string }>;
 }) {
   // auth.ts の async session(...) によって UI側で...
   // const session = await auth();
@@ -184,15 +190,15 @@ export default async function Home({
     );
   }
 
-  // 入力された一文をパース（?q= で渡ってくる）。?wo=週送り / ?md=メンバー予定の日送り
+  // 入力された一文をパース（?q= で渡ってくる）。?wo=会議室の週送り / ?d=メンバー予定の日付
   // ?p=選択メール(カンマ区切り) / ?dur=所要時間(分) はチップ選択の状態
-  const { q, wo: woRaw, md: mdRaw, p: pRaw, dur: durRaw } = await searchParams;
+  const { q, wo: woRaw, d: dRaw, p: pRaw, dur: durRaw } = await searchParams;
   const wo = Math.min(MAX_WO, Math.max(0, Number.parseInt(woRaw ?? "0", 10) || 0));
-  // md 未指定なら表示窓の先頭日（wo*5）＝5営業日ナビと連動。指定があればその日
-  const md = Math.min(
-    MEMBER_MAX_MD,
-    Math.max(0, mdRaw != null ? Number.parseInt(mdRaw, 10) || 0 : wo * 5),
-  );
+  // メンバーの予定の表示日。未指定なら今日（今日が土日なら次の平日）。範囲は今日〜+92日
+  const memberYmd = resolveMemberDay(dRaw, businessDay(0).ymd);
+  const memberRange = memberDayRange();
+  const prevYmd = shiftBusinessDay(memberYmd, -1);
+  const nextYmd = shiftBusinessDay(memberYmd, 1);
   let parsed:
     | { request: MeetingRequest; matched: Person[]; unmatched: string[] }
     | null = null;
@@ -274,36 +280,30 @@ export default async function Home({
   const peopleAttendees = searched ? calcPeople.map((p) => p.email) : [];
   const bookingSummary = searched ? `会議：${calcPeople.map((p) => p.name).join("、")}` : "";
 
-  // 表示する平日5日（今日起点・wo ページ目）＋ メンバー一覧の表示日（md 番目の平日）
+  // 会議室: 今日起点の平日5日（wo ページ目）。メンバーの予定: 表示日(memberYmd)の1日分。
+  // 2つは独立に取得する（メンバーの日が遠くても、間の期間をまとめて取らない）
   const days = businessDaysPage(wo);
-  const memberDay = businessDay(md);
-  const now = new Date();
-  const firstYmd = days[0]?.ymd ?? memberDay.ymd;
+  const memberDay = { ymd: memberYmd, label: dayLabelOf(memberYmd) };
+  const firstYmd = days[0]?.ymd ?? memberYmd;
   const lastYmd = days[days.length - 1]?.ymd ?? firstYmd;
-  const windowStartMs = new Date(`${firstYmd}T00:00:00+09:00`).getTime();
-  const windowEndMs = new Date(`${lastYmd}T23:59:59+09:00`).getTime();
-  const memberDayStartMs = new Date(`${memberDay.ymd}T00:00:00+09:00`).getTime();
-  const memberDayEndMs = new Date(`${memberDay.ymd}T23:59:59+09:00`).getTime();
-  // サマリー窓・メンバー表示日・直近2週間、すべてを1回の取得でまかなう
-  const fetchMinMs = Math.min(windowStartMs, memberDayStartMs, now.getTime());
-  const fetchMaxMs = Math.max(
-    windowEndMs,
-    memberDayEndMs,
-    now.getTime() + 14 * 24 * 60 * 60 * 1000,
-  );
-  const results = await listEventsForTargets(
-    session.accessToken,
-    buildTargets(),
-    new Date(fetchMinMs).toISOString(),
-    new Date(fetchMaxMs).toISOString(),
-  );
+  const [roomResults, peopleResults] = await Promise.all([
+    listEventsForTargets(
+      session.accessToken,
+      [{ name: ROOM.name, calendarId: ROOM.calendarId }],
+      `${firstYmd}T00:00:00+09:00`,
+      `${lastYmd}T23:59:59+09:00`,
+    ),
+    listEventsForTargets(
+      session.accessToken,
+      PEOPLE.map((p) => ({ name: p.name, calendarId: p.email })),
+      `${memberYmd}T00:00:00+09:00`,
+      `${memberYmd}T23:59:59+09:00`,
+    ),
+  ]);
 
-  const summary = buildWeekSummary(results, ROOM.calendarId, days);
+  const summary = buildWeekSummary(roomResults, ROOM.calendarId, days);
   // メンバー一覧ヒートマップ（memberDay の1日分）
-  const memberHeatmaps = buildMemberDayHeatmaps(
-    results.filter((r) => r.calendarId !== ROOM.calendarId),
-    memberDay.ymd,
-  );
+  const memberHeatmaps = buildMemberDayHeatmaps(peopleResults, memberDay.ymd);
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-[1760px] flex-col px-6 py-3">
@@ -412,8 +412,14 @@ export default async function Home({
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                {md > 0 ? (
-                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, md: md - 1 })}>
+                {/* 日付を直接選ぶ（日付以外の条件は hrefBase に含める） */}
+                <MemberDayPicker
+                  value={memberYmd}
+                  min={memberRange.min}
+                  max={memberRange.max}
+                  hrefBase={hrefWith({ q, p: pRaw, dur: durRaw, wo })}                />
+                {prevYmd >= memberRange.min ? (
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, d: prevYmd })}>
                     <Button type="button" variant="outline" size="sm">
                       <ChevronLeft className="h-4 w-4" />
                       前日
@@ -425,8 +431,8 @@ export default async function Home({
                     前日
                   </Button>
                 )}
-                {md < MEMBER_MAX_MD ? (
-                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, md: md + 1 })}>
+                {nextYmd <= memberRange.max ? (
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo, d: nextYmd })}>
                     <Button type="button" variant="outline" size="sm">
                       翌日
                       <ChevronRight className="h-4 w-4" />
@@ -520,7 +526,7 @@ export default async function Home({
               </div>
               <div className="flex items-center gap-2">
                 {wo > 0 ? (
-                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo - 1 })}>
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo - 1, d: dRaw ? memberYmd : undefined })}>
                     <Button type="button" variant="outline" size="sm">
                       <ChevronLeft className="h-4 w-4" />
                       前の5営業日
@@ -533,7 +539,7 @@ export default async function Home({
                   </Button>
                 )}
                 {wo < MAX_WO ? (
-                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo + 1 })}>
+                  <Link href={hrefWith({ q, p: pRaw, dur: durRaw, wo: wo + 1, d: dRaw ? memberYmd : undefined })}>
                     <Button type="button" variant="outline" size="sm">
                       次の5営業日
                       <ChevronRight className="h-4 w-4" />
