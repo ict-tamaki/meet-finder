@@ -17,10 +17,12 @@ export function ParticipantPicker({
   people,
   initialSelected,
   initialDuration,
+  actions,
 }: {
   people: PickerPerson[];
   initialSelected: string[]; // 選択済みメール
   initialDuration: number;
+  actions?: React.ReactNode; // チップ行の右端に置くもの（Googleカレンダーへのリンク・ログアウト）
 }) {
   const [selected, setSelected] = useState<string[]>(initialSelected);
   const [duration, setDuration] = useState(initialDuration);
@@ -108,7 +110,7 @@ export function ParticipantPicker({
         </div>
       </div>
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         {people.map((p) => {
           const on = selected.includes(p.email);
           return (
@@ -131,6 +133,7 @@ export function ParticipantPicker({
             </button>
           );
         })}
+        {actions && <div className="ml-auto flex items-center gap-3">{actions}</div>}
       </div>
     </div>
   );

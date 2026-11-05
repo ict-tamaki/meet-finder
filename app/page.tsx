@@ -120,12 +120,13 @@ function memberCellColor(s: MemberSlotState, i: number): string {
 }
 
 // 時刻の目盛り（9〜18時）。コアタイム 11–16 は背景の帯で示す
-function TimeAxis() {
+// labelWidth: 行の名前／日付列と同じ幅の Tailwind クラス（目盛りとセルをずらさないため）
+function TimeAxis({ labelWidth }: { labelWidth: string }) {
   const left = (CORE_START / CELLS_PER_DAY) * 100;
   const width = ((CORE_END - CORE_START) / CELLS_PER_DAY) * 100;
   return (
     <div className="flex items-center gap-3">
-      <div className="w-36 shrink-0" />
+      <div className={["shrink-0", labelWidth].join(" ")} />
       <div className="relative flex-1">
         <div
           className="absolute inset-y-0 rounded bg-brand/20"
@@ -306,36 +307,34 @@ export default async function Home({
 
   return (
     <main className="mx-auto flex min-h-screen w-full max-w-[1760px] flex-col px-6 py-3">
-      <div className="mb-3 flex items-center justify-between">
-        <h1 className="flex items-center gap-2 text-xl font-semibold">
-          <CalendarCheck className="h-6 w-6 text-primary" />
-          みんなの日程調整くん
-        </h1>
-        <div className="flex items-center gap-3">
-          <a
-            href="https://calendar.google.com/calendar/"
-            target="_blank"
-            rel="noreferrer"
-            className="flex items-center gap-1 text-sm text-muted-foreground underline-offset-4 hover:underline"
-          >
-            <ExternalLink className="h-3.5 w-3.5" />
-            Googleカレンダー
-          </a>
-          <form action={async () => { "use server"; await signOut(); }}>
-            <Button type="submit" className="cursor-pointer" variant="outline" size="sm">
-              <LogOut className="h-3.5 w-3.5" />
-              ログアウト
-            </Button>
-          </form>
-        </div>
-      </div>
+      {/* 画面上のタイトルは出さない（高さを確保）。スクリーンリーダー向けにだけ残す */}
+      <h1 className="sr-only">みんなの日程調整くん</h1>
 
-      {/* 参加者チップ＋所要時間（選択状態が変わったら key で初期化し直す） */}
+      {/* 参加者チップ＋所要時間（選択状態が変わったら key で初期化し直す）。リンクとログアウトはチップ行の右端 */}
       <ParticipantPicker
         key={`${selectedEmails.join(",")}|${selectedDuration}`}
         people={PEOPLE.map(({ name, email, image }) => ({ name, email, image }))}
         initialSelected={selectedEmails}
         initialDuration={selectedDuration}
+        actions={
+          <>
+            <a
+              href="https://calendar.google.com/calendar/"
+              target="_blank"
+              rel="noreferrer"
+              className="flex items-center gap-1 text-sm text-muted-foreground underline-offset-4 hover:underline"
+            >
+              <ExternalLink className="h-3.5 w-3.5" />
+              Googleカレンダー
+            </a>
+            <form action={async () => { "use server"; await signOut(); }}>
+              <Button type="submit" className="cursor-pointer" variant="outline" size="sm">
+                <LogOut className="h-3.5 w-3.5" />
+                ログアウト
+              </Button>
+            </form>
+          </>
+        }
       />
 
       {/* 自然文の入力欄(SearchForm)は画面から外した。?q= を直接指定した場合の解析結果だけ表示する */}
@@ -442,7 +441,7 @@ export default async function Home({
               </div>
             </div>
 
-            <TimeAxis />
+            <TimeAxis labelWidth="w-28" />
 
             {/* メンバー行（左=アイコン＋名前 / 右=ヒートマップ帯） */}
             {/* 行は画面の残り高さに合わせて伸縮する（最小 40px / 最大 48px。セルが縦長にならない範囲） */}
@@ -458,7 +457,7 @@ export default async function Home({
                     isSelected ? "rounded bg-paper" : "",
                   ].join(" ")}
                 >
-                  <div className="flex w-36 shrink-0 items-center gap-2">
+                  <div className="flex w-28 shrink-0 items-center gap-2">
                     <Avatar src={person?.image} name={m.name} size={32} />
                     <span className={["truncate text-base", isSelected ? "font-semibold" : ""].join(" ")}>
                       {m.name}
@@ -549,7 +548,7 @@ export default async function Home({
               </div>
             </div>
 
-            <TimeAxis />
+            <TimeAxis labelWidth="w-24" />
 
             {/* 行は画面の残り高さに合わせて伸縮する（最小 40px / 最大 64px） */}
             <div className="flex flex-1 flex-col">
@@ -558,7 +557,7 @@ export default async function Home({
                   key={d.label}
                   className="flex max-h-16 min-h-10 flex-1 items-stretch gap-3 border-b py-1 last:border-b-0"
                 >
-                  <span className="w-36 shrink-0 self-center text-base font-medium">{d.label}</span>
+                  <span className="w-24 shrink-0 self-center text-base font-medium">{d.label}</span>
                   <div className="flex flex-1 gap-px overflow-hidden rounded">
                     {d.cells.map((c, i) => (
                       <div
